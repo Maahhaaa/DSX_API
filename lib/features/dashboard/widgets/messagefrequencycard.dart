@@ -1,36 +1,24 @@
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
+import 'package:gp/core/services/can_service.dart';
 import 'package:gp/core/theme/app_colors.dart';
 
-class MessageFrequencyCard extends StatefulWidget {
-  const MessageFrequencyCard({super.key});
+class MessageFrequencyCard extends StatelessWidget {
+  final double frequency;
+  final List<CANMessage> messages;
 
-  static const List<FlSpot> _dataPoints = [
-    FlSpot(0, 1200),
-    FlSpot(5, 1400),
-    FlSpot(10, 1800),
-    FlSpot(15, 2200),
-    FlSpot(20, 3000),
-    FlSpot(25, 4500),
-    FlSpot(30, 7000),
-    FlSpot(35, 10000),
-    FlSpot(40, 12405),
-    FlSpot(45, 12000),
-    FlSpot(50, 11200),
-    FlSpot(55, 10800),
-    FlSpot(60, 11000),
-  ];
+  const MessageFrequencyCard({
+    super.key,
+    required this.frequency,
+    required this.messages,
+  });
 
-  static const List<String> _timeLabels = ["14:31:00", "14:31:30", "14:32:00"];
-
-  @override
-  State<MessageFrequencyCard> createState() => _MessageFrequencyCardState();
-}
-
-class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
   @override
   Widget build(BuildContext context) {
+    final spots = _spots;
+    final labels = _timeLabels;
+
     return Container(
       padding: EdgeInsets.all(16.r),
       decoration: BoxDecoration(
@@ -41,7 +29,6 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header row
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -59,7 +46,7 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                   ),
                   SizedBox(height: 4.h),
                   Text(
-                    "12,405 Hz",
+                    "${frequency.toStringAsFixed(frequency >= 100 ? 0 : 1)} Hz",
                     style: TextStyle(
                       color: Colors.white,
                       fontSize: 24.sp,
@@ -68,31 +55,28 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                   ),
                 ],
               ),
-              // Spike badge
-              Container(
-                padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 5.h),
-                decoration: BoxDecoration(
-                  color: AppColors.primaryred.withValues(alpha: 0.2),
-                  borderRadius: BorderRadius.circular(6.r),
-                  border: Border.all(
-                    color: AppColors.primaryred.withValues(alpha: 0.4),
+              if (frequency > 1000)
+                Container(
+                  padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 5.h),
+                  decoration: BoxDecoration(
+                    color: AppColors.primaryred.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(6.r),
+                    border: Border.all(
+                      color: AppColors.primaryred.withValues(alpha: 0.4),
+                    ),
+                  ),
+                  child: Text(
+                    "High traffic",
+                    style: TextStyle(
+                      color: AppColors.primaryred,
+                      fontSize: 11.sp,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
-                child: Text(
-                  "+400% Spike",
-                  style: TextStyle(
-                    color: AppColors.primaryred,
-                    fontSize: 11.sp,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
             ],
           ),
-
           SizedBox(height: 20.h),
-
-          // Chart
           SizedBox(
             height: 160.h,
             child: Padding(
@@ -102,7 +86,7 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                   gridData: FlGridData(
                     show: true,
                     drawVerticalLine: false,
-                    horizontalInterval: 4000,
+                    horizontalInterval: _maxY(spots) / 4,
                     getDrawingHorizontalLine: (_) => FlLine(
                       color: AppColors.gradblue.withValues(alpha: 0.8),
                       strokeWidth: 1,
@@ -126,14 +110,14 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                         interval: 30,
                         reservedSize: 28.h,
                         getTitlesWidget: (value, meta) {
-                          int index = (value / 30).round();
-                          if (index < 0 || index >= MessageFrequencyCard._timeLabels.length) {
+                          final index = (value / 30).round();
+                          if (index < 0 || index >= labels.length) {
                             return const SizedBox.shrink();
                           }
                           return Padding(
                             padding: EdgeInsets.only(top: 10.h),
                             child: Text(
-                              MessageFrequencyCard._timeLabels[index],
+                              labels[index],
                               style: TextStyle(
                                 color: AppColors.greyColor,
                                 fontSize: 10.sp,
@@ -146,7 +130,7 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                   ),
                   lineBarsData: [
                     LineChartBarData(
-                      spots: MessageFrequencyCard._dataPoints,
+                      spots: spots,
                       isCurved: true,
                       curveSmoothness: 0.4,
                       color: AppColors.secondaryblueColor,
@@ -161,7 +145,7 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                             AppColors.secondaryblueColor.withValues(
                               alpha: 0.35,
                             ),
-                            AppColors.secondaryblueColor.withValues(alpha: 0.0),
+                            AppColors.secondaryblueColor.withValues(alpha: 0),
                           ],
                         ),
                       ),
@@ -170,7 +154,7 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
                   minX: 0,
                   maxX: 60,
                   minY: 0,
-                  maxY: 14000,
+                  maxY: _maxY(spots),
                 ),
               ),
             ),
@@ -179,4 +163,47 @@ class _MessageFrequencyCardState extends State<MessageFrequencyCard> {
       ),
     );
   }
+
+  List<FlSpot> get _spots {
+    if (messages.isEmpty) return const [FlSpot(0, 0), FlSpot(60, 0)];
+    final start = messages.first.timestamp;
+    final computed = messages.map((message) {
+      final x = (message.timestamp - start).clamp(0, 60).toDouble();
+      final y = message.timeDiff > 0 ? 1 / message.timeDiff : frequency;
+      return FlSpot(x, y.isFinite ? y : 0);
+    }).toList();
+    if (computed.length == 1) return [const FlSpot(0, 0), computed.first];
+    return computed;
+  }
+
+  List<String> get _timeLabels {
+    if (messages.isEmpty) return const ["--:--", "--:--", "--:--"];
+    return [
+      _formatTimestamp(messages.first.timestamp),
+      _formatTimestamp(messages[messages.length ~/ 2].timestamp),
+      _formatTimestamp(messages.last.timestamp),
+    ];
+  }
+
+  double _maxY(List<FlSpot> spots) {
+    final highest = spots.map((spot) => spot.y).fold<double>(frequency, (a, b) {
+      return a > b ? a : b;
+    });
+    if (highest <= 0) return 10;
+    return highest * 1.2;
+  }
+
+  String _formatTimestamp(double timestamp) {
+    if (timestamp <= 0) return "--:--";
+    final millis = timestamp > 1000000000000
+        ? timestamp.toInt()
+        : timestamp > 1000000000
+        ? (timestamp * 1000).toInt()
+        : null;
+    if (millis == null) return "${timestamp.toStringAsFixed(1)}s";
+    final date = DateTime.fromMillisecondsSinceEpoch(millis);
+    return "${_twoDigits(date.hour)}:${_twoDigits(date.minute)}:${_twoDigits(date.second)}";
+  }
+
+  String _twoDigits(int value) => value.toString().padLeft(2, '0');
 }

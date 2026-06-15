@@ -9,8 +9,8 @@ class LastAlertCard extends StatelessWidget {
 
   const LastAlertCard({
     super.key,
-    this.time = "10:42 AM",
-    this.alertTitle = "Port Scan Detected",
+    this.time = "--",
+    this.alertTitle = "No alerts",
     this.onDetailsTap,
   });
 

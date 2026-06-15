@@ -12,4 +12,5 @@ class Images {
   static String criticalicon = "assets/icons/critical.png";
   static String warningicon = "assets/icons/warning.png";
   static String infoicon = "assets/icons/info.png";
+  static String offlineicon = "assets/icons/offline.png";
 }
