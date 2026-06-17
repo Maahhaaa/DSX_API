@@ -1,4 +1,7 @@
-import 'package:firebase_database/firebase_database.dart';
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
 
 class CANMessage {
   final String canId;
@@ -23,7 +26,7 @@ class CANMessage {
   });
 
   factory CANMessage.fromMap(Map map) => CANMessage(
-    canId: map['can_id']?.toString() ?? '0x0',
+    canId: (map['canId'] ?? map['can_id'])?.toString() ?? '0x0',
     timestamp: _toDouble(map['timestamp']),
     byte1: _toInt(map['byte1']),
     byte2: _toInt(map['byte2']),
@@ -45,7 +48,7 @@ class CANStats {
   final int normalCount;
   final String? lastAlert;
 
-  CANStats({
+  const CANStats({
     required this.messageFrequency,
     required this.totalMessages,
     required this.dosCount,
@@ -63,79 +66,265 @@ class CANStats {
 }
 
 class CANService {
-  final _db = FirebaseDatabase.instance;
+  static final _poller = _CANApiPoller(
+    Uri.parse('http://172.16.223.200:8000/latest'),
+  );
 
   Stream<bool> connectedStream() {
-    return _db.ref('.info/connected').onValue.map(
-      (event) => event.snapshot.value == true,
-    );
+    return _poller.stream.map((snapshot) => snapshot.isConnected).distinct();
   }
 
-  // Live latest messages. orderByKey avoids requiring a timestamp index in RTDB rules.
+  // Live latest attack messages from the API, capped with FIFO at 50.
   Stream<List<CANMessage>> messagesStream() {
-    return _db
-        .ref('can_messages')
-        .orderByKey()
-        .limitToLast(50)
-        .onValue
-        .map((event) => _messagesFromSnapshotValue(event.snapshot.value));
+    return _poller.stream.map((snapshot) => snapshot.messages);
   }
 
   Future<List<CANMessage>> latestMessagesOnce() async {
-    final snapshot = await _db
-        .ref('can_messages')
-        .orderByKey()
-        .limitToLast(50)
-        .get();
-    return _messagesFromSnapshotValue(snapshot.value);
+    return (await _poller.fetchNow()).messages;
+  }
+
+  Stream<CANMessage?> latestMessageStream() {
+    return _poller.stream.map((snapshot) => snapshot.latestMessage);
+  }
+
+  Future<CANMessage?> latestMessageOnce() async {
+    return (await _poller.fetchNow()).latestMessage;
   }
 
   // only attack messages
   Stream<List<CANMessage>> alertsStream() {
-    return messagesStream().map(
-      (msgs) => msgs.where((m) => m.label.toLowerCase() != 'normal').toList(),
-    );
+    return messagesStream();
   }
 
   // stats (frequency, counts, last alert)
   Stream<CANStats> statsStream() {
-    return _db.ref('stats').onValue.map((event) {
-      final data = event.snapshot.value;
-      if (data == null || data is! Map) {
-        return CANStats(
-          messageFrequency: 0,
-          totalMessages: 0,
-          dosCount: 0,
-          normalCount: 0,
-        );
-      }
-      return CANStats.fromMap(Map.from(data));
-    });
+    return _poller.stream.map((snapshot) => snapshot.stats);
   }
 
   Future<CANStats> latestStatsOnce() async {
-    final snapshot = await _db.ref('stats').get();
-    final data = snapshot.value;
-    if (data == null || data is! Map) {
-      return CANStats(
-        messageFrequency: 0,
-        totalMessages: 0,
-        dosCount: 0,
-        normalCount: 0,
-      );
-    }
-    return CANStats.fromMap(Map.from(data));
+    return (await _poller.fetchNow()).stats;
+  }
+
+  Future<void> blockAttack() {
+    return _poller.blockAttack();
   }
 }
 
-List<CANMessage> _messagesFromSnapshotValue(Object? value) {
-  if (value == null || value is! Map) return [];
-  return value.values
-      .whereType<Map>()
-      .map((e) => CANMessage.fromMap(Map.from(e)))
-      .toList()
-    ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+class _CANApiSnapshot {
+  final bool isConnected;
+  final List<CANMessage> messages;
+  final CANMessage? latestMessage;
+  final CANStats stats;
+
+  const _CANApiSnapshot({
+    required this.isConnected,
+    required this.messages,
+    required this.latestMessage,
+    required this.stats,
+  });
+
+  factory _CANApiSnapshot.disconnected([
+    List<CANMessage> messages = const [],
+    CANStats? stats,
+  ]) {
+    return _CANApiSnapshot(
+      isConnected: false,
+      messages: messages,
+      latestMessage: null,
+      stats: stats ?? _emptyStats,
+    );
+  }
 }
+
+class _CANApiPoller {
+  static const _pollInterval = Duration(milliseconds: 500);
+  static const _maxMessages = 50;
+
+  final Uri endpoint;
+  final http.Client _client;
+  final StreamController<_CANApiSnapshot> _controller =
+      StreamController<_CANApiSnapshot>.broadcast();
+
+  Timer? _timer;
+  _CANApiSnapshot _latest = _CANApiSnapshot.disconnected();
+  final List<CANMessage> _messageBuffer = [];
+  final Set<String> _messageKeys = {};
+
+  _CANApiPoller(this.endpoint, {http.Client? client})
+    : _client = client ?? http.Client() {
+    _controller.onListen = _start;
+    _controller.onCancel = _stopIfIdle;
+  }
+
+  Stream<_CANApiSnapshot> get stream async* {
+    yield _latest;
+    yield* _controller.stream;
+  }
+
+  Future<_CANApiSnapshot> fetchNow() => _fetchAndPublish();
+
+  Future<void> blockAttack() async {
+    final response = await _client.post(endpoint.replace(path: '/block_attack'));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw http.ClientException(
+        'API returned ${response.statusCode}',
+        endpoint.replace(path: '/block_attack'),
+      );
+    }
+  }
+
+  void _start() {
+    _timer ??= Timer.periodic(_pollInterval, (_) => _fetchAndPublish());
+    unawaited(_fetchAndPublish());
+  }
+
+  void _stopIfIdle() {
+    if (!_controller.hasListener) {
+      _timer?.cancel();
+      _timer = null;
+    }
+  }
+
+  Future<_CANApiSnapshot> _fetchAndPublish() async {
+    try {
+      final response = await _client.get(endpoint);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw http.ClientException(
+          'API returned ${response.statusCode}',
+          endpoint,
+        );
+      }
+
+      final decoded = jsonDecode(response.body);
+      final incomingMessages = _messagesFromApiValue(decoded);
+      final latestMessage = incomingMessages.isEmpty
+          ? _latest.latestMessage
+          : incomingMessages.last;
+      final messages = _mergeAttackMessages(incomingMessages);
+      final stats = _statsFromMessages(messages);
+      _latest = _CANApiSnapshot(
+        isConnected: true,
+        messages: messages,
+        latestMessage: latestMessage,
+        stats: stats,
+      );
+    } catch (_) {
+      _latest = _CANApiSnapshot.disconnected(_latest.messages, _latest.stats);
+    }
+
+    if (!_controller.isClosed) _controller.add(_latest);
+    return _latest;
+  }
+
+  List<CANMessage> _mergeAttackMessages(List<CANMessage> incoming) {
+    for (final message in incoming) {
+      if (!_isAttackMessage(message)) continue;
+
+      final key = _messageKey(message);
+      if (_messageKeys.contains(key)) continue;
+
+      _messageBuffer.add(message);
+      _messageKeys.add(key);
+      _messageBuffer.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+      while (_messageBuffer.length > _maxMessages) {
+        final removed = _messageBuffer.removeAt(0);
+        _messageKeys.remove(_messageKey(removed));
+      }
+    }
+
+    return List.unmodifiable(_messageBuffer);
+  }
+}
+
+bool _isAttackMessage(CANMessage message) {
+  return message.label.toLowerCase() != 'normal';
+}
+
+String _messageKey(CANMessage message) {
+  return [
+    message.timestamp,
+    message.canId,
+    message.byte1,
+    message.byte2,
+    message.byte3,
+    message.byte4,
+    message.byte5,
+    message.byte6,
+    message.byte7,
+    message.byte8,
+    message.timeDiff,
+    message.label,
+  ].join('|');
+}
+
+List<CANMessage> _messagesFromApiValue(Object? value) {
+  final messagesValue = _extractMessagesValue(value);
+  if (messagesValue is List) {
+    return messagesValue
+        .whereType<Map>()
+        .map((e) => CANMessage.fromMap(Map.from(e)))
+        .toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  }
+  if (messagesValue is Map) {
+    if (_looksLikeMessage(messagesValue)) {
+      return [CANMessage.fromMap(Map.from(messagesValue))];
+    }
+    return messagesValue.values
+        .whereType<Map>()
+        .map((e) => CANMessage.fromMap(Map.from(e)))
+        .toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  }
+  return [];
+}
+
+Object? _extractMessagesValue(Object? value) {
+  if (value is List) return value;
+  if (value is! Map) return null;
+
+  for (final key in ['can_messages', 'messages', 'data', 'latest']) {
+    if (value.containsKey(key)) return value[key];
+  }
+
+  return _looksLikeMessage(value) ? value : null;
+}
+
+CANStats _statsFromMessages(List<CANMessage> messages) {
+  if (messages.isEmpty) return _emptyStats;
+
+  final normalCount = messages
+      .where((message) => message.label.toLowerCase() == 'normal')
+      .length;
+  final attackMessages = messages
+      .where((message) => message.label.toLowerCase() != 'normal')
+      .toList();
+  final firstTimestamp = messages.first.timestamp;
+  final lastTimestamp = messages.last.timestamp;
+  final elapsed = lastTimestamp - firstTimestamp;
+
+  return CANStats(
+    messageFrequency: elapsed > 0 ? messages.length / elapsed : 0,
+    totalMessages: messages.length,
+    dosCount: attackMessages.length,
+    normalCount: normalCount,
+    lastAlert: attackMessages.isEmpty ? null : attackMessages.last.label,
+  );
+}
+
+bool _looksLikeMessage(Map value) {
+  return value.containsKey('can_id') ||
+      value.containsKey('timestamp') ||
+      value.containsKey('byte1');
+}
+
+const _emptyStats = CANStats(
+  messageFrequency: 0,
+  totalMessages: 0,
+  dosCount: 0,
+  normalCount: 0,
+);
 
 double _toDouble(Object? value) {
   if (value is num) return value.toDouble();

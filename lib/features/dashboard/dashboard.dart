@@ -20,20 +20,24 @@ class _DashboardState extends State<Dashboard> {
 
   bool _isScanning = false;
   bool _isConnected = false;
+  bool _hasAttack = false;
+  String? _blockedAttackKey;
   CANStats? _stats;
+  CANMessage? _latestMessage;
   List<CANMessage> _messages = [];
 
   StreamSubscription? _statsSubscription;
   StreamSubscription? _messagesSubscription;
+  StreamSubscription? _latestMessageSubscription;
   StreamSubscription? _connectedSubscription;
 
   @override
   void initState() {
     super.initState();
-    _listenToFirebase();
+    _listenToCanApi();
   }
 
-  void _listenToFirebase() {
+  void _listenToCanApi() {
     _connectedSubscription = _canService.connectedStream().listen((connected) {
       if (!mounted) return;
       setState(() => _isConnected = connected);
@@ -48,24 +52,46 @@ class _DashboardState extends State<Dashboard> {
       if (!mounted) return;
       setState(() => _messages = messages);
     });
+
+    _latestMessageSubscription = _canService.latestMessageStream().listen((
+      message,
+    ) {
+      if (!mounted || message == null) return;
+      setState(() {
+        _latestMessage = message;
+        _hasAttack =
+            _isAttackMessage(message) &&
+            _messageKey(message) != _blockedAttackKey;
+        if (!_isAttackMessage(message)) {
+          _blockedAttackKey = null;
+        }
+      });
+    });
   }
 
-  Future<void> _startScan() async {
+  Future<void> _blockAttack() async {
     setState(() => _isScanning = true);
 
     try {
-      final messages = await _canService.latestMessagesOnce();
-      final stats = await _canService.latestStatsOnce();
+      await _canService.blockAttack();
       if (!mounted) return;
       setState(() {
-        _messages = messages;
-        _stats = stats;
+        if (_latestMessage != null && _isAttackMessage(_latestMessage!)) {
+          _blockedAttackKey = _messageKey(_latestMessage!);
+        }
+        _hasAttack = false;
       });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('System is secure'),
+          backgroundColor: AppColors.primarygreen,
+        ),
+      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Scan failed: $e'),
+            content: Text('Block attack failed: $e'),
             backgroundColor: AppColors.primaryred,
           ),
         );
@@ -79,17 +105,17 @@ class _DashboardState extends State<Dashboard> {
   void dispose() {
     _statsSubscription?.cancel();
     _messagesSubscription?.cancel();
+    _latestMessageSubscription?.cancel();
     _connectedSubscription?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final alerts = _messages
-        .where((m) => m.label.toLowerCase() != 'normal')
-        .toList();
+    final alerts = _messages.where(_isAttackMessage).toList();
     final lastAlert = alerts.isNotEmpty ? alerts.last : null;
-    final hasAttack = (_stats?.dosCount ?? 0) > 0;
+    final latestScanMessage =
+        _latestMessage ?? (_messages.isNotEmpty ? _messages.last : null);
 
     return Scaffold(
       backgroundColor: AppColors.primaryblueColor,
@@ -123,21 +149,19 @@ class _DashboardState extends State<Dashboard> {
                   children: [
                     _SystemStatusBadge(
                       isConnected: _isConnected,
-                      hasAttack: hasAttack,
+                      hasAttack: _hasAttack,
                     ),
                     SizedBox(height: 28.h),
                     Text(
                       !_isConnected
                           ? "Disconnected"
-                          : hasAttack
-                              ? "Threat Detected"
-                              : "Safe",
-                      style: Styles.inter32bold.copyWith(
-                        color: Colors.white,
-                      ),
+                          : _hasAttack
+                          ? "Threat Detected"
+                          : "Safe",
+                      style: Styles.inter32bold.copyWith(color: Colors.white),
                     ),
                     Text(
-                      "Last scan: ${_lastScanLabel(_messages)}",
+                      "Last scan: ${_lastScanLabel(latestScanMessage)}",
                       style: Styles.inter14medium.copyWith(
                         color: AppColors.greyColor,
                       ),
@@ -145,9 +169,9 @@ class _DashboardState extends State<Dashboard> {
                     Padding(
                       padding: EdgeInsets.only(top: 24.h),
                       child: ElevatedButton(
-                        onPressed: _isScanning ? null : _startScan,
+                        onPressed: _isScanning ? null : _blockAttack,
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: AppColors.secondaryblueColor,
+                          backgroundColor: AppColors.primaryred,
                           foregroundColor: Colors.white,
                           maximumSize: Size(167.w, 46.h),
                           shape: RoundedRectangleBorder(
@@ -167,13 +191,15 @@ class _DashboardState extends State<Dashboard> {
                                     ),
                                   )
                                 : Image.asset(
-                                    Images.scan,
+                                    Images.criticalicon,
                                     width: 17.w,
                                     height: 17.h,
+                                    color: Colors.white,
+                                    colorBlendMode: BlendMode.srcIn,
                                   ),
                             SizedBox(width: 8.w),
                             Text(
-                              _isScanning ? "Scanning..." : "Scan Now",
+                              "Take Action",
                               style: Styles.inter16semi.copyWith(
                                 color: Colors.white,
                               ),
@@ -192,9 +218,7 @@ class _DashboardState extends State<Dashboard> {
                       time: lastAlert == null
                           ? "--"
                           : _formatTimestamp(lastAlert.timestamp),
-                      alertTitle: _stats?.lastAlert ??
-                          lastAlert?.label ??
-                          "No alerts",
+                      alertTitle: lastAlert?.label ?? "No alerts",
                       onDetailsTap: () {},
                     ),
                     SizedBox(height: 10.h),
@@ -208,9 +232,9 @@ class _DashboardState extends State<Dashboard> {
     );
   }
 
-  String _lastScanLabel(List<CANMessage> messages) {
-    if (messages.isEmpty) return "No data";
-    final timestamp = messages.last.timestamp;
+  String _lastScanLabel(CANMessage? message) {
+    if (message == null) return "No data";
+    final timestamp = message.timestamp;
     final time = _timestampToDateTime(timestamp);
     if (time == null) return "${timestamp.toStringAsFixed(1)}s";
     final diff = DateTime.now().difference(time);
@@ -218,6 +242,14 @@ class _DashboardState extends State<Dashboard> {
     if (diff.inHours < 1) return "${diff.inMinutes} min ago";
     if (diff.inDays < 1) return "${diff.inHours} hr ago";
     return "${diff.inDays} day ago";
+  }
+
+  bool _isAttackMessage(CANMessage message) {
+    return message.label.toLowerCase() != 'normal';
+  }
+
+  String _messageKey(CANMessage message) {
+    return '${message.timestamp}|${message.canId}|${message.label}';
   }
 
   String _formatTimestamp(double timestamp) {
@@ -254,20 +286,20 @@ class _SystemStatusBadge extends StatelessWidget {
     final color = !isConnected
         ? AppColors.greyColor
         : hasAttack
-            ? AppColors.primaryred
-            : AppColors.primarygreen;
+        ? AppColors.primaryred
+        : AppColors.primarygreen;
 
     final label = !isConnected
-        ? "DATABASE OFFLINE"
+        ? "API OFFLINE"
         : hasAttack
-            ? "ALERT ACTIVE"
-            : "SYSTEM SECURE";
+        ? "ALERT ACTIVE"
+        : "SYSTEM SECURE";
 
     final deticon = !isConnected
         ? Images.offlineicon
         : hasAttack
-            ? Images.criticalicon
-            : Images.sysSecure;
+        ? Images.criticalicon
+        : Images.sysSecure;
 
     return Container(
       height: 45.h,
@@ -275,10 +307,7 @@ class _SystemStatusBadge extends StatelessWidget {
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(9999.r),
-        border: Border.all(
-          color: color.withValues(alpha: 0.4),
-          width: 0.9.w,
-        ),
+        border: Border.all(color: color.withValues(alpha: 0.4), width: 0.9.w),
         boxShadow: [
           BoxShadow(
             color: color.withValues(alpha: 0.2),

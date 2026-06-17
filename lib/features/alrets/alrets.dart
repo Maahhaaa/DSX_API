@@ -174,7 +174,7 @@ class _AlretsState extends State<Alrets> {
   }
 
   String _descriptionFor(CANMessage message) {
-    return "CAN ID ${message.canId} reported ${message.label} activity.";
+    return "Attack detected in CAN message ID ${message.canId}.";
   }
 
   String _timeLabel(double timestamp) {
